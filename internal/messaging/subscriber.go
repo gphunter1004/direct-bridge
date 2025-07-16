@@ -78,19 +78,11 @@ func (s *Subscriber) handlePLCCommand(client mqtt.Client, msg mqtt.Message) {
 
 // handleRobotState 로봇 상태 메시지 처리
 func (s *Subscriber) handleRobotState(client mqtt.Client, msg mqtt.Message) {
-	// 로봇 상태 메시지도 상세 로깅 (DEBUG 레벨에서만 페이로드 출력)
+	// 로봇 상태 메시지도 전체 페이로드 출력 (줄이지 않음)
 	utils.Logger.Infof("📨 MQTT RECEIVED")
 	utils.Logger.Infof("📨 Topic   : %s", msg.Topic())
 	utils.Logger.Infof("📨 QoS    : %d, MessageID: %d", msg.Qos(), msg.MessageID())
-
-	// 로봇 상태는 너무 길어질 수 있으므로 DEBUG 레벨에서만 전체 페이로드 출력
-	payload := string(msg.Payload())
-	if len(payload) > 500 {
-		utils.Logger.Infof("📨 Payload : %s... (truncated, %d chars total)", payload[:500], len(payload))
-		utils.Logger.Debugf("📨 Full Payload: %s", payload)
-	} else {
-		utils.Logger.Infof("📨 Payload : %s", payload)
-	}
+	utils.Logger.Infof("📨 Payload : %s", string(msg.Payload()))
 
 	s.handler.HandleRobotState(client, msg)
 }

@@ -1,4 +1,4 @@
-// internal/messaging/handler.go - Direct Action Only
+// internal/messaging/handler.go
 package messaging
 
 import (
@@ -60,15 +60,25 @@ func (h *DirectActionHandler) HandleRobotState(client mqtt.Client, msg mqtt.Mess
 		return
 	}
 
-	// OrderID가 있고 액션 상태가 있는지 확인
+	// OrderID 확인
 	orderID, hasOrderID := stateMsg["orderId"].(string)
-	actionStates, hasActions := stateMsg["actionStates"].([]interface{})
+	if !hasOrderID || orderID == "" {
+		utils.Logger.Debugf("📊 Robot state without orderID")
+		return
+	}
 
-	if hasOrderID && hasActions && orderID != "" {
-		utils.Logger.Infof("📊 Robot State Analysis: OrderID=%s, ActionCount=%d", orderID, len(actionStates))
-		h.processActionStates(orderID, actionStates)
-	} else {
-		utils.Logger.Debugf("📊 Robot state without relevant order/action data")
+	// 활성 오더인지 확인
+	originalCommand, exists := h.activeOrders[orderID]
+	if !exists {
+		utils.Logger.Debugf("🔍 OrderID %s not in active orders, skipping", orderID)
+		return
+	}
+
+	// 액션 상태 처리
+	actionStates, hasActions := stateMsg["actionStates"].([]interface{})
+	if hasActions {
+		utils.Logger.Infof("🔍 Processing action states for OrderID: %s (Command: %s)", orderID, originalCommand)
+		h.processActionStates(orderID, originalCommand, actionStates)
 	}
 }
 
@@ -104,37 +114,37 @@ func (h *DirectActionHandler) handleDirectAction(commandStr string) {
 	h.activeOrders[orderID] = commandStr
 
 	utils.Logger.Infof("✅ Direct action order sent: %s (OrderID: %s)", commandStr, orderID)
-	utils.Logger.Infof("📝 Waiting for robot state to send K response...")
+	utils.Logger.Infof("📝 Waiting for robot state to send response...")
 }
 
 // sendDirectActionOrder Direct Action 오더 전송
 func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandType rune, armParam string) (string, error) {
 	var actionType string
-	var actionParameters []map[string]interface{}
+	var actionParameters []types.ActionParameter
 
 	switch commandType {
 	case 'I':
 		actionType = "Roboligent Robin - Inference"
-		actionParameters = []map[string]interface{}{
+		actionParameters = []types.ActionParameter{
 			{
-				"key":   "inference_name",
-				"value": baseCommand,
+				Key:   "inference_name",
+				Value: baseCommand,
 			},
 		}
 	case 'T':
 		actionType = "Roboligent Robin - Follow Trajectory"
-		actionParameters = []map[string]interface{}{
+		actionParameters = []types.ActionParameter{
 			{
-				"key":   "trajectory_name",
-				"value": baseCommand,
+				Key:   "trajectory_name",
+				Value: baseCommand,
 			},
 		}
 
 		// arm 파라미터 처리
 		arm := h.parseArmParam(armParam)
-		actionParameters = append(actionParameters, map[string]interface{}{
-			"key":   "arm",
-			"value": arm,
+		actionParameters = append(actionParameters, types.ActionParameter{
+			Key:   "arm",
+			Value: arm,
 		})
 
 	default:
@@ -145,48 +155,62 @@ func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandT
 	nodeID := h.generateNodeID()
 	actionID := h.generateActionID()
 
-	directOrder := map[string]interface{}{
-		"headerId":      h.getNextHeaderID(),
-		"timestamp":     time.Now().Format(time.RFC3339Nano),
-		"version":       "2.0.0",
-		"manufacturer":  h.config.RobotManufacturer,
-		"serialNumber":  h.config.RobotSerialNumber,
-		"orderId":       orderID,
-		"orderUpdateId": 0,
-		"nodes": []map[string]interface{}{
-			{
-				"nodeId":      nodeID,
-				"description": fmt.Sprintf("Direct action for command %s", baseCommand),
-				"sequenceId":  1,
-				"released":    true,
-				"nodePosition": map[string]interface{}{
-					"x":                     types.ZeroFloat64(),
-					"y":                     types.ZeroFloat64(),
-					"theta":                 types.ZeroFloat64(),
-					"allowedDeviationXY":    types.ZeroFloat64(),
-					"allowedDeviationTheta": types.ZeroFloat64(),
-					"mapId":                 "",
-				},
-				"actions": []map[string]interface{}{
-					{
-						"actionType":        actionType,
-						"actionId":          actionID,
-						"actionDescription": fmt.Sprintf("Execute %s for %s", actionType, baseCommand),
-						"blockingType":      "NONE",
-						"actionParameters":  actionParameters,
-					},
-				},
-			},
-		},
-		"edges": []map[string]interface{}{},
+	// 구조체를 사용하여 오더 생성
+	order := types.NewOrderMessage(
+		h.getNextHeaderID(),
+		h.config.RobotManufacturer,
+		h.config.RobotSerialNumber,
+		orderID,
+		0,
+	)
+
+	// 노드 생성
+	node := types.NewNode(nodeID, 1, true)
+
+	// 노드 설명 설정
+	nodeDescription := fmt.Sprintf("Direct action for command %s", baseCommand)
+	node.NodeDescription = &nodeDescription
+
+	// 노드 위치 설정 (기본값)
+	theta := 0.0
+	allowedDeviationXY := 0.0
+	allowedDeviationTheta := 0.0
+	mapDescription := ""
+
+	node.NodePosition = &types.NodePosition{
+		X:                     0.0,
+		Y:                     0.0,
+		Theta:                 &theta,
+		AllowedDeviationXY:    &allowedDeviationXY,
+		AllowedDeviationTheta: &allowedDeviationTheta,
+		MapID:                 "",
+		MapDescription:        &mapDescription,
+	}
+
+	// 액션 생성
+	action := types.NewAction(actionType, actionID, types.BlockingTypeNone)
+
+	// 액션 설명 설정
+	actionDescription := fmt.Sprintf("Execute %s for %s", actionType, baseCommand)
+	action.ActionDescription = &actionDescription
+
+	// 액션 파라미터 설정
+	action.ActionParameters = actionParameters
+
+	// 노드에 액션 추가
+	node.AddAction(action)
+
+	// 오더에 노드 추가
+	order.AddNode(node)
+
+	// 오더를 JSON으로 마샬링
+	msgData, err := json.Marshal(order)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal order: %v", err)
 	}
 
 	// 오더 전송
 	topic := fmt.Sprintf("meili/v2/%s/%s/order", h.config.RobotManufacturer, h.config.RobotSerialNumber)
-	msgData, err := json.Marshal(directOrder)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal order: %v", err)
-	}
 
 	utils.Logger.Infof("📤 Sending Robot Order to: %s", topic)
 	utils.Logger.Infof("📤 Order Details: OrderID=%s, ActionType=%s, BaseCommand=%s", orderID, actionType, baseCommand)
@@ -200,21 +224,13 @@ func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandT
 }
 
 // processActionStates 액션 상태 처리
-func (h *DirectActionHandler) processActionStates(orderID string, actionStates []interface{}) {
-	// 활성 오더인지 확인
-	originalCommand, exists := h.activeOrders[orderID]
-	if !exists {
-		utils.Logger.Debugf("🔍 OrderID %s not in active orders, skipping", orderID)
-		return
-	}
-
-	utils.Logger.Infof("🔍 Processing action states for OrderID: %s (Command: %s)", orderID, originalCommand)
-
+func (h *DirectActionHandler) processActionStates(orderID, originalCommand string, actionStates []interface{}) {
 	// 액션 상태들을 확인하여 전체 상태 결정
+	hasWaiting := false
+	hasInitializing := false
 	hasRunning := false
 	hasFinished := false
 	hasFailed := false
-	hasWaiting := false
 
 	for _, actionState := range actionStates {
 		if actionMap, ok := actionState.(map[string]interface{}); ok {
@@ -225,8 +241,10 @@ func (h *DirectActionHandler) processActionStates(orderID string, actionStates [
 				utils.Logger.Infof("🔍 Action %s status: %s", actionID, actionStatus)
 
 				switch actionStatus {
-				case "WAITING", "INITIALIZING":
+				case "WAITING":
 					hasWaiting = true
+				case "INITIALIZING":
+					hasInitializing = true
 				case "RUNNING":
 					hasRunning = true
 				case "FINISHED":
@@ -238,24 +256,24 @@ func (h *DirectActionHandler) processActionStates(orderID string, actionStates [
 		}
 	}
 
-	// 상태에 따른 응답 결정 및 전송
+	// 상태에 따른 응답 결정 및 전송 (우선순위 순서)
 	if hasFailed {
 		utils.Logger.Errorf("❌ Action failed for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, "F", "Action failed")
 		delete(h.activeOrders, orderID) // 완료된 오더 제거
-	} else if hasFinished && !hasRunning && !hasWaiting {
+	} else if hasFinished && !hasRunning && !hasInitializing && !hasWaiting {
 		utils.Logger.Infof("✅ All actions finished for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, "S", "Action completed successfully")
 		delete(h.activeOrders, orderID) // 완료된 오더 제거
 	} else if hasRunning {
 		utils.Logger.Infof("🏃 Action running for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, "R", "Action is running")
-		// 실행 중이므로 오더는 유지
+	} else if hasInitializing {
+		utils.Logger.Infof("🔄 Action initializing for OrderID: %s", orderID)
+		h.sendPLCResponse(originalCommand, "I", "Action is initializing")
 	} else if hasWaiting {
-		// 처음 WAITING 상태일 때 K(Acknowledged) 응답
-		utils.Logger.Infof("⏳ Action acknowledged for OrderID: %s", orderID)
-		h.sendPLCResponse(originalCommand, "K", "Order acknowledged by robot")
-		// 대기 중이므로 오더는 유지
+		utils.Logger.Infof("⏳ Action waiting for OrderID: %s", orderID)
+		h.sendPLCResponse(originalCommand, "W", "Action is waiting")
 	}
 }
 
@@ -267,12 +285,16 @@ func (h *DirectActionHandler) sendPLCResponse(command, status, message string) {
 		utils.Logger.Errorf("Command %s failed: %s", command, message)
 	}
 
-	utils.Logger.Infof("📤 Sending PLC Response: %s", response)
+	utils.Logger.Infof("📤 MQTT PUBLISH")
+	utils.Logger.Infof("📤 Topic   : %s", h.config.PlcResponseTopic)
+	utils.Logger.Infof("📤 QoS    : %d, Retained: %v", 0, false)
+	utils.Logger.Infof("📤 Payload : %s", response)
+	utils.Logger.Infof("📤 Message : %s", message)
 
 	if err := h.mqttClient.Publish(h.config.PlcResponseTopic, 0, false, response); err != nil {
-		utils.Logger.Errorf("❌ Failed to send PLC response: %v", err)
+		utils.Logger.Errorf("❌ MQTT PUBLISH FAILED: %s - %v", h.config.PlcResponseTopic, err)
 	} else {
-		utils.Logger.Infof("✅ PLC Response sent successfully: %s", response)
+		utils.Logger.Infof("✅ MQTT PUBLISH SUCCESS: %s", h.config.PlcResponseTopic)
 	}
 }
 
