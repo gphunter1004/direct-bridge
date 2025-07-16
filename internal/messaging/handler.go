@@ -291,11 +291,7 @@ func (h *DirectActionHandler) sendPLCResponse(command, status, message string) {
 	utils.Logger.Infof("📤 Payload : %s", response)
 	utils.Logger.Infof("📤 Message : %s", message)
 
-	if err := h.mqttClient.Publish(h.config.PlcResponseTopic, 0, false, response); err != nil {
-		utils.Logger.Errorf("❌ MQTT PUBLISH FAILED: %s - %v", h.config.PlcResponseTopic, err)
-	} else {
-		utils.Logger.Infof("✅ MQTT PUBLISH SUCCESS: %s", h.config.PlcResponseTopic)
-	}
+	h.mqttClient.Publish(h.config.PlcResponseTopic, 0, false, response)
 }
 
 // extractBaseCommand 기본 명령 추출
