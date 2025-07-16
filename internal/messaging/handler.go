@@ -1,4 +1,4 @@
-// internal/messaging/handler.go
+// internal/messaging/handler.go - Direct Action Only (구조체 사용)
 package messaging
 
 import (
@@ -15,9 +15,10 @@ import (
 
 // DirectActionHandler Direct Action 처리 핸들러
 type DirectActionHandler struct {
-	mqttClient   *MQTTClient
-	config       *config.Config
-	activeOrders map[string]string // orderID -> original command mapping
+	mqttClient     *MQTTClient
+	config         *config.Config
+	activeOrders   map[string]string // orderID -> original command mapping
+	canceledOrders map[string]string // orderID -> original cancel command mapping (취소된 오더 추적)
 }
 
 // NewDirectActionHandler 새 Direct Action 핸들러 생성
@@ -25,9 +26,10 @@ func NewDirectActionHandler(mqttClient *MQTTClient, cfg *config.Config) *DirectA
 	utils.Logger.Infof("🏗️ Creating Direct Action Handler")
 
 	handler := &DirectActionHandler{
-		mqttClient:   mqttClient,
-		config:       cfg,
-		activeOrders: make(map[string]string),
+		mqttClient:     mqttClient,
+		config:         cfg,
+		activeOrders:   make(map[string]string),
+		canceledOrders: make(map[string]string),
 	}
 
 	utils.Logger.Infof("✅ Direct Action Handler Created")
@@ -39,10 +41,16 @@ func (h *DirectActionHandler) HandlePLCCommand(client mqtt.Client, msg mqtt.Mess
 	commandStr := strings.TrimSpace(string(msg.Payload()))
 	utils.Logger.Infof("🎯 PLC Command received: '%s'", commandStr)
 
+	// 취소 명령 확인
+	if h.isCancelCommand(commandStr) {
+		h.handleCancelCommand(commandStr)
+		return
+	}
+
 	// Direct Action 명령인지 확인
 	if !h.isDirectActionCommand(commandStr) {
 		utils.Logger.Errorf("❌ Non-direct action command rejected: %s", commandStr)
-		h.sendPLCResponse(commandStr, "F", "Only direct action commands are supported")
+		h.sendPLCResponse(commandStr, types.PLCStatusFailed)
 		return
 	}
 
@@ -62,23 +70,26 @@ func (h *DirectActionHandler) HandleRobotState(client mqtt.Client, msg mqtt.Mess
 
 	// OrderID 확인
 	orderID, hasOrderID := stateMsg["orderId"].(string)
-	if !hasOrderID || orderID == "" {
-		utils.Logger.Debugf("📊 Robot state without orderID")
-		return
-	}
+	if hasOrderID && orderID != "" {
+		actionStates, hasActions := stateMsg["actionStates"].([]interface{})
 
-	// 활성 오더인지 확인
-	originalCommand, exists := h.activeOrders[orderID]
-	if !exists {
-		utils.Logger.Debugf("🔍 OrderID %s not in active orders, skipping", orderID)
-		return
-	}
+		// 취소된 오더인지 확인 (PLC 취소 요청한 경우)
+		if originalCancelCommand, exists := h.canceledOrders[orderID]; exists {
+			if hasActions {
+				utils.Logger.Infof("🔍 Processing canceled order states for OrderID: %s", orderID)
+				h.processCanceledOrderStates(orderID, originalCancelCommand, actionStates)
+			}
+			return
+		}
 
-	// 액션 상태 처리
-	actionStates, hasActions := stateMsg["actionStates"].([]interface{})
-	if hasActions {
-		utils.Logger.Infof("🔍 Processing action states for OrderID: %s (Command: %s)", orderID, originalCommand)
-		h.processActionStates(orderID, originalCommand, actionStates)
+		// 활성 오더 처리 (일반 실행 중이거나 로봇 자체 취소된 경우)
+		originalCommand, exists := h.activeOrders[orderID]
+		if exists {
+			if hasActions {
+				utils.Logger.Infof("🔍 Processing action states for OrderID: %s (Command: %s)", orderID, originalCommand)
+				h.processActionStates(orderID, originalCommand, actionStates)
+			}
+		}
 	}
 }
 
@@ -87,11 +98,16 @@ func (h *DirectActionHandler) isDirectActionCommand(commandStr string) bool {
 	return strings.HasSuffix(commandStr, ":I") || strings.Contains(commandStr, ":T")
 }
 
+// isCancelCommand 취소 명령인지 확인
+func (h *DirectActionHandler) isCancelCommand(commandStr string) bool {
+	return strings.HasSuffix(commandStr, ":C")
+}
+
 // handleDirectAction Direct Action 처리
 func (h *DirectActionHandler) handleDirectAction(commandStr string) {
 	parts := strings.Split(commandStr, ":")
 	if len(parts) < 2 {
-		h.sendPLCResponse(commandStr, "F", "Invalid command format")
+		h.sendPLCResponse(commandStr, types.PLCStatusFailed)
 		return
 	}
 
@@ -106,7 +122,7 @@ func (h *DirectActionHandler) handleDirectAction(commandStr string) {
 	orderID, err := h.sendDirectActionOrder(baseCommand, cmdType, armParam)
 	if err != nil {
 		utils.Logger.Errorf("❌ Failed to send direct action order: %v", err)
-		h.sendPLCResponse(commandStr, "F", "Failed to send order to robot")
+		h.sendPLCResponse(commandStr, types.PLCStatusFailed)
 		return
 	}
 
@@ -117,7 +133,42 @@ func (h *DirectActionHandler) handleDirectAction(commandStr string) {
 	utils.Logger.Infof("📝 Waiting for robot state to send response...")
 }
 
-// sendDirectActionOrder Direct Action 오더 전송
+// handleCancelCommand 취소 명령 처리
+func (h *DirectActionHandler) handleCancelCommand(commandStr string) {
+	baseCommand := h.extractBaseCommand(commandStr)
+
+	// 해당 명령에 대한 활성 오더 찾기
+	var targetOrderID string
+	for orderID, originalCommand := range h.activeOrders {
+		if h.extractBaseCommand(originalCommand) == baseCommand {
+			targetOrderID = orderID
+			break
+		}
+	}
+
+	if targetOrderID == "" {
+		utils.Logger.Warnf("⚠️ No active order found for command: %s", baseCommand)
+		h.sendPLCResponse(commandStr, types.PLCStatusFailed)
+		return
+	}
+
+	// InstantActions로 취소 명령 전송
+	err := h.sendCancelOrder(targetOrderID)
+	if err != nil {
+		utils.Logger.Errorf("❌ Failed to send cancel order: %v", err)
+		h.sendPLCResponse(commandStr, types.PLCStatusFailed)
+		return
+	}
+
+	// 활성 오더에서 제거하고 취소된 오더로 이동
+	delete(h.activeOrders, targetOrderID)
+	h.canceledOrders[targetOrderID] = commandStr
+
+	utils.Logger.Infof("✅ Cancel order sent for: %s (OrderID: %s)", baseCommand, targetOrderID)
+	utils.Logger.Infof("📝 Waiting for canceled order state to send response...")
+}
+
+// sendDirectActionOrder Direct Action 오더 전송 (구조체 사용)
 func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandType rune, armParam string) (string, error) {
 	var actionType string
 	var actionParameters []types.ActionParameter
@@ -223,6 +274,42 @@ func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandT
 	return orderID, nil
 }
 
+// sendCancelOrder InstantActions로 취소 명령 전송
+func (h *DirectActionHandler) sendCancelOrder(orderID string) error {
+	// InstantActions 메시지 생성
+	instantActions := types.NewInstantActionsMessage(
+		h.getNextHeaderID(),
+		h.config.RobotManufacturer,
+		h.config.RobotSerialNumber,
+	)
+
+	// 취소 액션 생성
+	actionID := h.generateActionID()
+	cancelAction := types.NewInstantAction("cancelOrder", actionID, types.BlockingTypeHard)
+
+	// InstantActions에 액션 추가
+	instantActions.AddAction(cancelAction)
+
+	// JSON 마샬링
+	msgData, err := json.Marshal(instantActions)
+	if err != nil {
+		return fmt.Errorf("failed to marshal instant actions: %v", err)
+	}
+
+	// 전송
+	topic := fmt.Sprintf("meili/v2/%s/%s/instantActions", h.config.RobotManufacturer, h.config.RobotSerialNumber)
+
+	utils.Logger.Infof("📤 Sending Cancel Order via InstantActions to: %s", topic)
+	utils.Logger.Infof("📤 Cancel Details: OrderID=%s, ActionID=%s", orderID, actionID)
+
+	if err := h.mqttClient.Publish(topic, 0, false, msgData); err != nil {
+		return err
+	}
+
+	utils.Logger.Infof("✅ Cancel order sent successfully via InstantActions")
+	return nil
+}
+
 // processActionStates 액션 상태 처리
 func (h *DirectActionHandler) processActionStates(orderID, originalCommand string, actionStates []interface{}) {
 	// 액션 상태들을 확인하여 전체 상태 결정
@@ -259,39 +346,67 @@ func (h *DirectActionHandler) processActionStates(orderID, originalCommand strin
 	// 상태에 따른 응답 결정 및 전송 (우선순위 순서)
 	if hasFailed {
 		utils.Logger.Errorf("❌ Action failed for OrderID: %s", orderID)
-		h.sendPLCResponse(originalCommand, "F", "Action failed")
+		h.sendPLCResponse(originalCommand, types.PLCStatusFailed)
 		delete(h.activeOrders, orderID) // 완료된 오더 제거
 	} else if hasFinished && !hasRunning && !hasInitializing && !hasWaiting {
 		utils.Logger.Infof("✅ All actions finished for OrderID: %s", orderID)
-		h.sendPLCResponse(originalCommand, "S", "Action completed successfully")
+		h.sendPLCResponse(originalCommand, types.PLCStatusSuccess)
 		delete(h.activeOrders, orderID) // 완료된 오더 제거
 	} else if hasRunning {
 		utils.Logger.Infof("🏃 Action running for OrderID: %s", orderID)
-		h.sendPLCResponse(originalCommand, "R", "Action is running")
+		h.sendPLCResponse(originalCommand, types.PLCStatusRunning)
 	} else if hasInitializing {
 		utils.Logger.Infof("🔄 Action initializing for OrderID: %s", orderID)
-		h.sendPLCResponse(originalCommand, "I", "Action is initializing")
+		h.sendPLCResponse(originalCommand, types.PLCStatusInitializing)
 	} else if hasWaiting {
 		utils.Logger.Infof("⏳ Action waiting for OrderID: %s", orderID)
-		h.sendPLCResponse(originalCommand, "W", "Action is waiting")
+		h.sendPLCResponse(originalCommand, types.PLCStatusWaiting)
 	}
 }
 
-// sendPLCResponse PLC에 응답 전송
-func (h *DirectActionHandler) sendPLCResponse(command, status, message string) {
-	response := fmt.Sprintf("%s:%s", h.extractBaseCommand(command), status)
+// processCanceledOrderStates 취소된 오더 상태 처리 (PLC 취소 요청 후)
+func (h *DirectActionHandler) processCanceledOrderStates(orderID, originalCancelCommand string, actionStates []interface{}) {
+	// 취소된 오더의 액션 상태에 따라 취소 명령에 대한 응답 처리
+	for _, actionState := range actionStates {
+		if actionMap, ok := actionState.(map[string]interface{}); ok {
+			actionStatus, hasStatus := actionMap["actionStatus"].(string)
+			actionID, _ := actionMap["actionId"].(string)
 
-	if status == "F" && message != "" {
-		utils.Logger.Errorf("Command %s failed: %s", command, message)
+			if hasStatus {
+				utils.Logger.Infof("🔍 Canceled Order Action %s status: %s", actionID, actionStatus)
+
+				switch actionStatus {
+				case "FAILED":
+					utils.Logger.Infof("✅ Canceled order action failed as expected: %s", orderID)
+					h.sendPLCResponse(originalCancelCommand, types.PLCStatusFailed)
+					delete(h.canceledOrders, orderID) // 처리 완료
+					return
+				case "FINISHED":
+					utils.Logger.Infof("✅ Canceled order action finished: %s", orderID)
+					h.sendPLCResponse(originalCancelCommand, types.PLCStatusSuccess)
+					delete(h.canceledOrders, orderID) // 처리 완료
+					return
+				}
+			}
+		}
 	}
+}
+
+// sendPLCResponse PLC에 응답 전송 (구조체 사용)
+func (h *DirectActionHandler) sendPLCResponse(command, status string) {
+	// PLC 응답 구조체 생성
+	plcResponse := types.NewPLCResponse(command, status, "")
+
+	// 기존 형식의 응답 문자열 생성 (COMMAND:STATUS)
+	responseStr := plcResponse.ToResponseString()
 
 	utils.Logger.Infof("📤 MQTT PUBLISH")
 	utils.Logger.Infof("📤 Topic   : %s", h.config.PlcResponseTopic)
 	utils.Logger.Infof("📤 QoS    : %d, Retained: %v", 0, false)
-	utils.Logger.Infof("📤 Payload : %s", response)
-	utils.Logger.Infof("📤 Message : %s", message)
+	utils.Logger.Infof("📤 Payload : %s", responseStr)
 
-	h.mqttClient.Publish(h.config.PlcResponseTopic, 0, false, response)
+	// MQTTClient.Publish에서 이미 성공/실패 로그를 모두 출력하므로 여기서는 제거
+	h.mqttClient.Publish(h.config.PlcResponseTopic, 0, false, responseStr)
 }
 
 // extractBaseCommand 기본 명령 추출
