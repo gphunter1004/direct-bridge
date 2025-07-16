@@ -130,7 +130,6 @@ func (h *DirectActionHandler) handleDirectAction(commandStr string) {
 	h.activeOrders[orderID] = commandStr
 
 	utils.Logger.Infof("✅ Direct action order sent: %s (OrderID: %s)", commandStr, orderID)
-	utils.Logger.Infof("📝 Waiting for robot state to send response...")
 }
 
 // handleCancelCommand 취소 명령 처리
@@ -153,8 +152,7 @@ func (h *DirectActionHandler) handleCancelCommand(commandStr string) {
 	}
 
 	// InstantActions로 취소 명령 전송
-	err := h.sendCancelOrder(targetOrderID)
-	if err != nil {
+	if err := h.sendCancelOrder(targetOrderID); err != nil {
 		utils.Logger.Errorf("❌ Failed to send cancel order: %v", err)
 		h.sendPLCResponse(commandStr, types.PLCStatusFailed)
 		return
@@ -165,48 +163,48 @@ func (h *DirectActionHandler) handleCancelCommand(commandStr string) {
 	h.canceledOrders[targetOrderID] = commandStr
 
 	utils.Logger.Infof("✅ Cancel order sent for: %s (OrderID: %s)", baseCommand, targetOrderID)
-	utils.Logger.Infof("📝 Waiting for canceled order state to send response...")
 }
 
 // sendDirectActionOrder Direct Action 오더 전송 (구조체 사용)
 func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandType rune, armParam string) (string, error) {
-	var actionType string
-	var actionParameters []types.ActionParameter
-
-	switch commandType {
-	case 'I':
-		actionType = "Roboligent Robin - Inference"
-		actionParameters = []types.ActionParameter{
-			{
-				Key:   "inference_name",
-				Value: baseCommand,
-			},
-		}
-	case 'T':
-		actionType = "Roboligent Robin - Follow Trajectory"
-		actionParameters = []types.ActionParameter{
-			{
-				Key:   "trajectory_name",
-				Value: baseCommand,
-			},
-		}
-
-		// arm 파라미터 처리
-		arm := h.parseArmParam(armParam)
-		actionParameters = append(actionParameters, types.ActionParameter{
-			Key:   "arm",
-			Value: arm,
-		})
-
-	default:
+	// 액션 타입과 파라미터 결정
+	actionType, actionParameters := h.buildActionParameters(baseCommand, commandType, armParam)
+	if actionType == "" {
 		return "", fmt.Errorf("invalid direct action command type: %c", commandType)
 	}
 
+	// ID 생성
 	orderID := h.generateOrderID()
 	nodeID := h.generateNodeID()
 	actionID := h.generateActionID()
 
-	// 구조체를 사용하여 오더 생성
+	// 오더 생성
+	order := h.buildOrder(orderID, nodeID, actionID, baseCommand, actionType, actionParameters)
+
+	// JSON 마샬링 및 전송
+	return h.publishOrder(order, orderID, actionType, baseCommand)
+}
+
+// buildActionParameters 액션 파라미터 구성
+func (h *DirectActionHandler) buildActionParameters(baseCommand string, commandType rune, armParam string) (string, []types.ActionParameter) {
+	switch commandType {
+	case 'I':
+		return "Roboligent Robin - Inference", []types.ActionParameter{
+			{Key: "inference_name", Value: baseCommand},
+		}
+	case 'T':
+		return "Roboligent Robin - Follow Trajectory", []types.ActionParameter{
+			{Key: "trajectory_name", Value: baseCommand},
+			{Key: "arm", Value: h.parseArmParam(armParam)},
+		}
+	default:
+		return "", nil
+	}
+}
+
+// buildOrder 오더 구조체 생성
+func (h *DirectActionHandler) buildOrder(orderID, nodeID, actionID, baseCommand, actionType string, actionParameters []types.ActionParameter) *types.OrderMessage {
+	// 오더 생성
 	order := types.NewOrderMessage(
 		h.getNextHeaderID(),
 		h.config.RobotManufacturer,
@@ -215,20 +213,33 @@ func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandT
 		0,
 	)
 
-	// 노드 생성
+	// 노드 생성 및 설정
 	node := types.NewNode(nodeID, 1, true)
-
-	// 노드 설명 설정
 	nodeDescription := fmt.Sprintf("Direct action for command %s", baseCommand)
 	node.NodeDescription = &nodeDescription
+	node.NodePosition = h.createDefaultNodePosition()
 
-	// 노드 위치 설정 (기본값)
+	// 액션 생성 및 설정
+	action := types.NewAction(actionType, actionID, types.BlockingTypeNone)
+	actionDescription := fmt.Sprintf("Execute %s for %s", actionType, baseCommand)
+	action.ActionDescription = &actionDescription
+	action.ActionParameters = actionParameters
+
+	// 노드에 액션 추가, 오더에 노드 추가
+	node.AddAction(action)
+	order.AddNode(node)
+
+	return order
+}
+
+// createDefaultNodePosition 기본 노드 위치 생성
+func (h *DirectActionHandler) createDefaultNodePosition() *types.NodePosition {
 	theta := 0.0
 	allowedDeviationXY := 0.0
 	allowedDeviationTheta := 0.0
 	mapDescription := ""
 
-	node.NodePosition = &types.NodePosition{
+	return &types.NodePosition{
 		X:                     0.0,
 		Y:                     0.0,
 		Theta:                 &theta,
@@ -237,30 +248,15 @@ func (h *DirectActionHandler) sendDirectActionOrder(baseCommand string, commandT
 		MapID:                 "",
 		MapDescription:        &mapDescription,
 	}
+}
 
-	// 액션 생성
-	action := types.NewAction(actionType, actionID, types.BlockingTypeNone)
-
-	// 액션 설명 설정
-	actionDescription := fmt.Sprintf("Execute %s for %s", actionType, baseCommand)
-	action.ActionDescription = &actionDescription
-
-	// 액션 파라미터 설정
-	action.ActionParameters = actionParameters
-
-	// 노드에 액션 추가
-	node.AddAction(action)
-
-	// 오더에 노드 추가
-	order.AddNode(node)
-
-	// 오더를 JSON으로 마샬링
+// publishOrder 오더 발행
+func (h *DirectActionHandler) publishOrder(order *types.OrderMessage, orderID, actionType, baseCommand string) (string, error) {
 	msgData, err := json.Marshal(order)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal order: %v", err)
 	}
 
-	// 오더 전송
 	topic := fmt.Sprintf("meili/v2/%s/%s/order", h.config.RobotManufacturer, h.config.RobotSerialNumber)
 
 	utils.Logger.Infof("📤 Sending Robot Order to: %s", topic)
@@ -313,52 +309,36 @@ func (h *DirectActionHandler) sendCancelOrder(orderID string) error {
 // processActionStates 액션 상태 처리
 func (h *DirectActionHandler) processActionStates(orderID, originalCommand string, actionStates []interface{}) {
 	// 액션 상태들을 확인하여 전체 상태 결정
-	hasWaiting := false
-	hasInitializing := false
-	hasRunning := false
-	hasFinished := false
-	hasFailed := false
+	statusCounts := make(map[string]int)
 
 	for _, actionState := range actionStates {
 		if actionMap, ok := actionState.(map[string]interface{}); ok {
-			actionStatus, hasStatus := actionMap["actionStatus"].(string)
-			actionID, _ := actionMap["actionId"].(string)
-
-			if hasStatus {
-				utils.Logger.Infof("🔍 Action %s status: %s", actionID, actionStatus)
-
-				switch actionStatus {
-				case "WAITING":
-					hasWaiting = true
-				case "INITIALIZING":
-					hasInitializing = true
-				case "RUNNING":
-					hasRunning = true
-				case "FINISHED":
-					hasFinished = true
-				case "FAILED":
-					hasFailed = true
+			if actionStatus, hasStatus := actionMap["actionStatus"].(string); hasStatus {
+				statusCounts[actionStatus]++
+				if actionID, _ := actionMap["actionId"].(string); actionID != "" {
+					utils.Logger.Infof("🔍 Action %s status: %s", actionID, actionStatus)
 				}
 			}
 		}
 	}
 
 	// 상태에 따른 응답 결정 및 전송 (우선순위 순서)
-	if hasFailed {
+	switch {
+	case statusCounts["FAILED"] > 0:
 		utils.Logger.Errorf("❌ Action failed for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, types.PLCStatusFailed)
-		delete(h.activeOrders, orderID) // 완료된 오더 제거
-	} else if hasFinished && !hasRunning && !hasInitializing && !hasWaiting {
+		delete(h.activeOrders, orderID)
+	case statusCounts["FINISHED"] > 0 && statusCounts["RUNNING"] == 0 && statusCounts["INITIALIZING"] == 0 && statusCounts["WAITING"] == 0:
 		utils.Logger.Infof("✅ All actions finished for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, types.PLCStatusSuccess)
-		delete(h.activeOrders, orderID) // 완료된 오더 제거
-	} else if hasRunning {
+		delete(h.activeOrders, orderID)
+	case statusCounts["RUNNING"] > 0:
 		utils.Logger.Infof("🏃 Action running for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, types.PLCStatusRunning)
-	} else if hasInitializing {
+	case statusCounts["INITIALIZING"] > 0:
 		utils.Logger.Infof("🔄 Action initializing for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, types.PLCStatusInitializing)
-	} else if hasWaiting {
+	case statusCounts["WAITING"] > 0:
 		utils.Logger.Infof("⏳ Action waiting for OrderID: %s", orderID)
 		h.sendPLCResponse(originalCommand, types.PLCStatusWaiting)
 	}
@@ -369,22 +349,20 @@ func (h *DirectActionHandler) processCanceledOrderStates(orderID, originalCancel
 	// 취소된 오더의 액션 상태에 따라 취소 명령에 대한 응답 처리
 	for _, actionState := range actionStates {
 		if actionMap, ok := actionState.(map[string]interface{}); ok {
-			actionStatus, hasStatus := actionMap["actionStatus"].(string)
-			actionID, _ := actionMap["actionId"].(string)
-
-			if hasStatus {
+			if actionStatus, hasStatus := actionMap["actionStatus"].(string); hasStatus {
+				actionID, _ := actionMap["actionId"].(string)
 				utils.Logger.Infof("🔍 Canceled Order Action %s status: %s", actionID, actionStatus)
 
 				switch actionStatus {
 				case "FAILED":
 					utils.Logger.Infof("✅ Canceled order action failed as expected: %s", orderID)
 					h.sendPLCResponse(originalCancelCommand, types.PLCStatusFailed)
-					delete(h.canceledOrders, orderID) // 처리 완료
+					delete(h.canceledOrders, orderID)
 					return
 				case "FINISHED":
 					utils.Logger.Infof("✅ Canceled order action finished: %s", orderID)
 					h.sendPLCResponse(originalCancelCommand, types.PLCStatusSuccess)
-					delete(h.canceledOrders, orderID) // 처리 완료
+					delete(h.canceledOrders, orderID)
 					return
 				}
 			}
