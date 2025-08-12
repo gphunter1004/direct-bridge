@@ -68,6 +68,20 @@ func (h *DirectActionHandler) HandleRobotState(client mqtt.Client, msg mqtt.Mess
 		return
 	}
 
+	// agvPosition.positionInitialized 확인 (false이면 initPosition 전송)
+	if agvPosition, hasAgvPosition := stateMsg["agvPosition"].(map[string]interface{}); hasAgvPosition {
+		if positionInitialized, hasPosition := agvPosition["positionInitialized"].(bool); hasPosition {
+			if !positionInitialized {
+				utils.Logger.Infof("🎯 Position not initialized (agvPosition.positionInitialized=false) - sending initPosition action")
+				if err := h.sendInitPositionAction(); err != nil {
+					utils.Logger.Errorf("❌ Failed to send initPosition action: %v", err)
+				} else {
+					utils.Logger.Infof("✅ InitPosition action sent due to agvPosition.positionInitialized=false")
+				}
+			}
+		}
+	}
+
 	// OrderID 확인
 	orderID, hasOrderID := stateMsg["orderId"].(string)
 	if hasOrderID && orderID != "" {
