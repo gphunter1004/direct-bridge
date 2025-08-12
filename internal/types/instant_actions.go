@@ -62,8 +62,19 @@ func NewInstantAction(actionType, actionID, blockingType string) InstantAction {
 
 // AddParameter InstantAction에 파라미터 추가
 func (a *InstantAction) AddParameter(key string, value interface{}) {
+	if a.ActionParameters == nil {
+		a.ActionParameters = make([]InstantActionParameter, 0)
+	}
 	a.ActionParameters = append(a.ActionParameters, InstantActionParameter{
 		Key:   key,
 		Value: value,
 	})
+}
+
+// NewInstantActionParameter 새 InstantAction 파라미터 생성
+func NewInstantActionParameter(key string, value interface{}) InstantActionParameter {
+	return InstantActionParameter{
+		Key:   key,
+		Value: value,
+	}
 }

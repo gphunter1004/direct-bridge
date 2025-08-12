@@ -1,4 +1,4 @@
-// internal/messaging/handler.go - Direct Action Only (구조체 사용)
+// internal/messaging/handler.go - Direct Action Only (구조체 사용) + Connection Handler
 package messaging
 
 import (
@@ -91,6 +91,124 @@ func (h *DirectActionHandler) HandleRobotState(client mqtt.Client, msg mqtt.Mess
 			}
 		}
 	}
+}
+
+// HandleRobotConnection 로봇 연결 상태 메시지 처리
+func (h *DirectActionHandler) HandleRobotConnection(client mqtt.Client, msg mqtt.Message) {
+	utils.Logger.Debugf("📡 Processing robot connection message")
+
+	var connectionMsg map[string]interface{}
+	if err := json.Unmarshal(msg.Payload(), &connectionMsg); err != nil {
+		utils.Logger.Errorf("❌ Failed to parse robot connection: %v", err)
+		return
+	}
+
+	// connectionState 확인
+	if connectionState, hasState := connectionMsg["connectionState"].(string); hasState {
+		utils.Logger.Infof("🔗 Robot connection state: %s", connectionState)
+
+		switch connectionState {
+		case "ONLINE":
+			utils.Logger.Infof("✅ Robot is ONLINE - sending initPosition")
+			h.handleRobotOnline()
+		case "CONNECTIONBROKEN":
+			utils.Logger.Warnf("⚠️ Robot connection is BROKEN")
+			h.handleRobotConnectionBroken()
+		case "OFFLINE":
+			utils.Logger.Warnf("⚠️ Robot is OFFLINE")
+			h.handleRobotOffline()
+		default:
+			utils.Logger.Infof("ℹ️ Unknown robot connection state: %s", connectionState)
+		}
+	}
+}
+
+// handleRobotOnline 로봇이 온라인 상태일 때 initPosition 전송
+func (h *DirectActionHandler) handleRobotOnline() {
+	utils.Logger.Infof("🎯 Robot is now ONLINE - sending initPosition action")
+
+	if err := h.sendInitPositionAction(); err != nil {
+		utils.Logger.Errorf("❌ Failed to send initPosition action: %v", err)
+	} else {
+		utils.Logger.Infof("✅ InitPosition action sent successfully")
+	}
+}
+
+// handleRobotConnectionBroken 로봇 연결이 끊어진 상태 처리
+func (h *DirectActionHandler) handleRobotConnectionBroken() {
+	utils.Logger.Warnf("⚠️ Robot connection is broken - pausing command processing")
+
+	// 연결이 복구될 때까지 새로운 명령 처리를 일시 중단할 수 있음
+	// 필요에 따라 추가 로직 구현
+}
+
+// handleRobotOffline 로봇이 오프라인 상태일 때 처리
+func (h *DirectActionHandler) handleRobotOffline() {
+	utils.Logger.Warnf("⚠️ Robot went OFFLINE - cleaning up active orders")
+
+	// 활성 오더들을 실패 처리
+	for orderID, originalCommand := range h.activeOrders {
+		utils.Logger.Warnf("⚠️ Marking active order as failed due to offline: %s", orderID)
+		h.sendPLCResponse(originalCommand, types.PLCStatusFailed)
+	}
+
+	// 취소된 오더들도 실패 처리
+	for orderID, originalCancelCommand := range h.canceledOrders {
+		utils.Logger.Warnf("⚠️ Marking canceled order as failed due to offline: %s", orderID)
+		h.sendPLCResponse(originalCancelCommand, types.PLCStatusFailed)
+	}
+
+	// 활성 오더 맵 정리
+	h.activeOrders = make(map[string]string)
+	h.canceledOrders = make(map[string]string)
+}
+
+// sendInitPositionAction initPosition InstantAction 전송
+func (h *DirectActionHandler) sendInitPositionAction() error {
+	// InstantActions 메시지 생성
+	instantActions := types.NewInstantActionsMessage(
+		h.getNextHeaderID(),
+		h.config.RobotManufacturer,
+		h.config.RobotSerialNumber,
+	)
+
+	// initPosition 액션 생성
+	actionID := h.generateActionID()
+	initAction := types.NewInstantAction("initPosition", actionID, types.BlockingTypeNone)
+
+	// pose 파라미터 생성
+	poseValue := map[string]interface{}{
+		"lastNodeId": "",
+		"mapId":      "",
+		"theta":      0.0,
+		"x":          0.0,
+		"y":          0.0,
+	}
+
+	// 액션에 pose 파라미터 추가
+	initAction.AddParameter("pose", poseValue)
+
+	// InstantActions에 액션 추가
+	instantActions.AddAction(initAction)
+
+	// JSON 마샬링
+	msgData, err := json.Marshal(instantActions)
+	if err != nil {
+		return fmt.Errorf("failed to marshal initPosition instant actions: %v", err)
+	}
+
+	// 전송
+	topic := fmt.Sprintf("meili/v2/%s/%s/instantActions", h.config.RobotManufacturer, h.config.RobotSerialNumber)
+
+	utils.Logger.Infof("📤 Sending InitPosition via InstantActions to: %s", topic)
+	utils.Logger.Infof("📤 InitPosition Details: ActionID=%s", actionID)
+
+	if err := h.mqttClient.Publish(topic, 0, false, msgData); err != nil {
+		return fmt.Errorf("failed to publish initPosition action: %v", err)
+	}
+
+	utils.Logger.Infof("✅ InitPosition action sent successfully via InstantActions")
+	return nil
 }
 
 // isDirectActionCommand Direct Action 명령인지 확인

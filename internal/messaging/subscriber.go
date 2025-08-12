@@ -1,4 +1,4 @@
-// internal/messaging/subscriber.go - Direct Action Only
+// internal/messaging/subscriber.go - Direct Action Only + Connection Handler
 package messaging
 
 import (
@@ -47,6 +47,11 @@ func (s *Subscriber) SubscribeAll() error {
 			description: "Robot States",
 			handler:     s.handleRobotState,
 		},
+		{
+			topic:       "meili/v2/+/+/connection",
+			description: "Robot Connection States",
+			handler:     s.handleRobotConnection,
+		},
 	}
 
 	// 각 토픽 구독
@@ -85,4 +90,14 @@ func (s *Subscriber) handleRobotState(client mqtt.Client, msg mqtt.Message) {
 	utils.Logger.Infof("📨 Payload : %s", string(msg.Payload()))
 
 	s.handler.HandleRobotState(client, msg)
+}
+
+// handleRobotConnection 로봇 연결 상태 메시지 처리
+func (s *Subscriber) handleRobotConnection(client mqtt.Client, msg mqtt.Message) {
+	utils.Logger.Infof("📨 MQTT RECEIVED")
+	utils.Logger.Infof("📨 Topic   : %s", msg.Topic())
+	utils.Logger.Infof("📨 QoS    : %d, MessageID: %d", msg.Qos(), msg.MessageID())
+	utils.Logger.Infof("📨 Payload : %s", string(msg.Payload()))
+
+	s.handler.HandleRobotConnection(client, msg)
 }
